@@ -26,6 +26,7 @@
         "public_url": "/",
         "public_url_no_trailing_slash_fix": false,
         "release": false,
+        "split": false,
         "target": "index.html"
       }
     },
@@ -229,6 +230,11 @@
             "string",
             "null"
           ]
+        },
+        "split": {
+          "description": "Enable split-WASM packaging for Rust main applications.",
+          "type": "boolean",
+          "default": false
         },
         "target": {
           "description": "The index HTML file to drive the bundling process",

@@ -4,6 +4,7 @@ mod output;
 mod sri;
 mod wasm_bindgen;
 mod wasm_opt;
+mod wasm_split;
 
 pub use output::RustAppOutput;
 
@@ -40,6 +41,11 @@ use tokio::{fs, io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandl
 use tracing::log;
 use wasm_bindgen::{WasmBindgenFeatures, WasmBindgenTarget, find_wasm_bindgen_version};
 use wasm_opt::WasmOptLevel;
+use wasm_split::{
+    WasmSplitManifest, WasmSplitStageOutput, output_file_name, output_file_stem,
+    rewrite_loader_paths, rewrite_prefetch_map, split_loader_file_name, split_manifest_file_name,
+    split_wasm_file_name,
+};
 
 /// A Rust application pipeline.
 pub struct RustApp {
@@ -99,6 +105,8 @@ pub struct RustApp {
     import_bindings_name: Option<String>,
     /// The name of the initializer module
     initializer: Option<PathBuf>,
+    /// Enable split-WASM packaging for this app.
+    split: bool,
 }
 
 /// Describes how the rust application is used.
@@ -199,12 +207,26 @@ impl RustApp {
         let name = bin
             .clone()
             .unwrap_or_else(|| manifest.package.name.to_string());
+        let html_split = attrs.contains_key("data-wasm-split");
 
         let loader_shim = attrs.contains_key("data-loader-shim");
         if loader_shim {
             ensure!(
                 app_type == RustAppType::Worker,
                 "Loader shim has no effect when data-type is \"main\"!"
+            );
+        }
+        if html_split {
+            ensure!(
+                app_type == RustAppType::Main,
+                "Split WASM is currently only supported for the main Rust application"
+            );
+        }
+        let split = matches!(app_type, RustAppType::Main) && (cfg.split || html_split);
+        if split {
+            ensure!(
+                wasm_bindgen_target == WasmBindgenTarget::Web,
+                "Split WASM currently requires data-bindgen-target=\"web\""
             );
         }
 
@@ -313,6 +335,7 @@ impl RustApp {
             import_bindings_name,
             initializer,
             target_path,
+            split,
         })
     }
 
@@ -335,6 +358,7 @@ impl RustApp {
         let manifest = CargoMetadata::new(&path).await?;
         let name = manifest.package.name.to_string();
         let integrity = IntegrityType::default_unless(cfg.no_sri);
+        let split = cfg.split;
 
         Ok(Some(Self {
             id: None,
@@ -363,6 +387,7 @@ impl RustApp {
             import_bindings_name: None,
             initializer: None,
             target_path: None,
+            split,
         }))
     }
 
@@ -380,15 +405,39 @@ impl RustApp {
 
         // run the cargo build
         let wasm = self.cargo_build().await.context("running cargo build")?;
+        let bundle_hash = self.hashed(&wasm).await.context("hashing wasm output")?;
+
+        let split_output = if self.split {
+            Some(
+                self.wasm_split_build(&wasm, bundle_hash.as_deref())
+                    .await
+                    .context("running wasm-split")?,
+            )
+        } else {
+            None
+        };
+
+        let wasm_bindgen_input = split_output
+            .as_ref()
+            .map(|output| output.main_wasm_path.as_path())
+            .unwrap_or(wasm.as_path());
 
         // run wasm-bindgen
         let mut output = self
-            .wasm_bindgen_build(&wasm)
+            .wasm_bindgen_build(wasm_bindgen_input, bundle_hash.as_deref())
             .await
             .context("running wasm-bindgen")?;
 
+        if let Some(split_output) = split_output {
+            output.split_loader_output = Some(split_output.split_loader_output);
+            output.split_manifest_output = Some(split_output.split_manifest_output);
+            output.auxiliary_wasm_outputs = split_output.split_wasm_outputs;
+        }
+
+        let wasm_outputs = output.wasm_outputs();
+
         // (optionally) run wasm-opt
-        self.wasm_opt_build(&output.wasm_output)
+        self.wasm_opt_build(&wasm_outputs)
             .await
             .context("running wasm-opt")?;
 
@@ -540,7 +589,137 @@ impl RustApp {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn wasm_bindgen_build(&mut self, wasm_path: &Path) -> Result<RustAppOutput> {
+    async fn wasm_split_build(
+        &mut self,
+        wasm_path: &Path,
+        bundle_hash: Option<&str>,
+    ) -> Result<WasmSplitStageOutput> {
+        let mode_segment = if self.cfg.release { "release" } else { "debug" };
+        let split_out = self
+            .manifest
+            .metadata
+            .target_directory
+            .join("wasm-split")
+            .join(mode_segment)
+            .join(&self.name)
+            .into_std_path_buf();
+        fs::create_dir_all(&split_out)
+            .await
+            .context("error creating wasm-split output dir")?;
+
+        let main_wasm_path = split_out.join("main.wasm");
+        let target_dir = target_path(&self.cfg.staging_dist, self.target_path.as_deref(), None)
+            .await
+            .context("error creating split target dir")?;
+        let split_loader_name = split_loader_file_name(bundle_hash);
+        let split_manifest_name = split_manifest_file_name(bundle_hash);
+        let split_loader_output =
+            apply_data_target_path(split_loader_name.clone(), &self.target_path);
+        let split_manifest_output =
+            apply_data_target_path(split_manifest_name.clone(), &self.target_path);
+        let entry_js_output = apply_data_target_path(
+            format!("{}.js", self.hashed_wasm_base(bundle_hash)),
+            &self.target_path,
+        );
+        let main_module = format!("./{}", output_file_name(&entry_js_output)?);
+        let link_name = format!("./{split_loader_name}");
+        let wasm_bytes = fs::read(wasm_path)
+            .await
+            .context("error reading wasm file for wasm-split")?;
+
+        let split_out_task = split_out.clone();
+        let main_wasm_path_task = main_wasm_path.clone();
+        let split_result = tokio::task::spawn_blocking(move || {
+            let mut opts = wasm_split_cli_support::Options::new(&wasm_bytes);
+            opts.output_dir = split_out_task.as_path();
+            opts.main_out_path = main_wasm_path_task.as_path();
+            opts.link_name = &link_name;
+            opts.main_module = &main_module;
+            opts.verbose = false;
+            wasm_split_cli_support::transform(opts).map_err(|err| {
+                anyhow!(
+                    "wasm-split transform failed: {err}. Ensure the app is built with upstream wasm-split runtime conventions (for example via #[wasm_split], #[lazy], or #[lazy_route])"
+                )
+            })
+        })
+        .await
+        .context("error awaiting wasm-split task")??;
+
+        let mut chunk_renames = std::collections::HashMap::new();
+        let mut prefetch_renames = std::collections::HashMap::new();
+        let mut split_wasm_outputs = Vec::with_capacity(split_result.split_modules.len());
+        for split_module in &split_result.split_modules {
+            let original_name = output_file_name(split_module)?;
+            let original_stem = output_file_stem(split_module)?;
+            let hashed_name = split_wasm_file_name(split_module, bundle_hash)?;
+            let hashed_output = apply_data_target_path(hashed_name.clone(), &self.target_path);
+            let staged_path = target_dir.join(&hashed_name);
+
+            tracing::debug!("copying {split_module:?} to {}", staged_path.display());
+            fs::copy(split_module, &staged_path)
+                .await
+                .context("error copying split wasm file to stage dir")?;
+
+            chunk_renames.insert(original_name, hashed_name);
+            prefetch_renames.insert(original_stem, output_file_name(&hashed_output)?);
+            split_wasm_outputs.push(hashed_output);
+        }
+
+        let split_loader_source = fs::read_to_string(split_out.join(&split_loader_name))
+            .await
+            .context("error reading generated wasm-split loader")?;
+        let split_loader_source = rewrite_loader_paths(split_loader_source, &chunk_renames);
+        let split_loader_bytes = if self.cfg.should_minify() {
+            minify_js(split_loader_source.into_bytes(), JsModuleType::Module)
+        } else {
+            split_loader_source.into_bytes()
+        };
+        let split_loader_path_dist = target_dir.join(&split_loader_name);
+
+        fs::write(&split_loader_path_dist, split_loader_bytes)
+            .await
+            .context("error writing split loader file to stage dir")?;
+
+        let split_manifest = WasmSplitManifest {
+            loader: output_file_name(&split_loader_output)?,
+            prefetch_map: rewrite_prefetch_map(split_result.prefetch_map, &prefetch_renames)
+                .context("error rewriting split prefetch map")?,
+        };
+        let split_manifest_bytes = if self.cfg.should_minify() {
+            serde_json::to_vec(&split_manifest)
+        } else {
+            serde_json::to_vec_pretty(&split_manifest)
+        }
+        .context("error serializing split manifest")?;
+        let split_manifest_path_dist = target_dir.join(&split_manifest_name);
+
+        fs::write(&split_manifest_path_dist, split_manifest_bytes)
+            .await
+            .context("error writing split manifest file to stage dir")?;
+
+        self.sri
+            .record_file(
+                SriType::ModulePreload,
+                &split_loader_output,
+                SriOptions::default(),
+                &split_loader_path_dist,
+            )
+            .await?;
+
+        Ok(WasmSplitStageOutput {
+            main_wasm_path,
+            split_loader_output,
+            split_manifest_output,
+            split_wasm_outputs,
+        })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn wasm_bindgen_build(
+        &mut self,
+        wasm_path: &Path,
+        bundle_hash: Option<&str>,
+    ) -> Result<RustAppOutput> {
         let version = find_wasm_bindgen_version(&self.cfg.tools, &self.manifest);
         let ToolInformation {
             path: wasm_bindgen,
@@ -586,6 +765,9 @@ impl RustApp {
         if self.weak_refs {
             args.push("--weak-refs");
         }
+        if self.split {
+            args.push("--keep-lld-exports");
+        }
         if !self.typescript {
             args.push("--no-typescript");
         }
@@ -607,7 +789,7 @@ impl RustApp {
 
         // Copy the generated WASM & JS loader to the dist dir.
         tracing::debug!("copying generated wasm-bindgen artifacts");
-        let hashed_name = self.hashed_wasm_base(wasm_path).await?;
+        let hashed_name = self.hashed_wasm_base(bundle_hash);
         let hashed_wasm_name =
             apply_data_target_path(format!("{hashed_name}_bg.wasm"), &self.target_path);
 
@@ -763,6 +945,9 @@ impl RustApp {
             cfg: self.cfg.clone(),
             js_output: hashed_js_name,
             wasm_output: hashed_wasm_name,
+            split_loader_output: None,
+            split_manifest_output: None,
+            auxiliary_wasm_outputs: Vec::new(),
             wasm_size,
             r#type: self.app_type,
             cross_origin: self.cross_origin,
@@ -819,19 +1004,17 @@ impl RustApp {
         })
     }
 
-    /// create a cache busting hashed name for the wasm file, if enabled.
-    async fn hashed_wasm_base(&self, wasm: &Path) -> Result<String> {
+    /// Create the cache-busting base name for the main wasm-bindgen outputs.
+    fn hashed_wasm_base(&self, bundle_hash: Option<&str>) -> String {
         // Skip the hashed file name for workers as their file name must be named at runtime.
         // Therefore, workers use the Cargo binary name for file naming.
         if self.app_type == RustAppType::Worker {
-            return Ok(self.name.clone());
+            return self.name.clone();
         }
 
-        Ok(self
-            .hashed(wasm)
-            .await?
+        bundle_hash
             .map(|hashed| format!("{}-{hashed}", self.name))
-            .unwrap_or_else(|| self.name.clone()))
+            .unwrap_or_else(|| self.name.clone())
     }
 
     fn is_relevant_artifact(&self, art: &Artifact) -> bool {
@@ -896,9 +1079,9 @@ impl RustApp {
         Ok(())
     }
 
-    /// Run `wasm-opt` on the `wasm_path` file, in-place.
+    /// Run `wasm-opt` on the generated wasm files, in-place.
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn wasm_opt_build(&self, wasm_name: &str) -> Result<()> {
+    async fn wasm_opt_build(&self, wasm_names: &[String]) -> Result<()> {
         // If not in release mode, we skip calling wasm-opt.
         if !self.cfg.release {
             return Ok(());
@@ -927,41 +1110,49 @@ impl RustApp {
             .metadata
             .target_directory
             .join(wasm_opt_name)
-            .join(mode_segment);
+            .join(mode_segment)
+            .into_std_path_buf();
         fs::create_dir_all(&output)
             .await
             .context("error creating wasm-opt output dir")?;
 
-        // Build up args for calling wasm-opt.
-        let output = output.join(format!("{}_bg.wasm", self.name));
-        let arg_output = format!("--output={output}");
-        let arg_opt_level = format!("-O{}", self.wasm_opt.as_ref());
-        let arg_opt_params = self.wasm_opt_params.as_slice();
-        let target_wasm = self
-            .cfg
-            .staging_dist
-            .join(wasm_name)
-            .to_string_lossy()
-            .to_string();
-        let mut args: Vec<&str> = vec![&arg_output, &arg_opt_level, &target_wasm];
+        for wasm_name in wasm_names {
+            let file_name = output_file_name(wasm_name)?;
 
-        if self.reference_types {
-            args.push("--enable-reference-types");
+            // Build up args for calling wasm-opt.
+            let optimized_output = output.join(&file_name);
+            let arg_output = format!("--output={}", optimized_output.display());
+            let arg_opt_level = format!("-O{}", self.wasm_opt.as_ref());
+            let arg_opt_params = self.wasm_opt_params.as_slice();
+            let target_wasm = self
+                .cfg
+                .staging_dist
+                .join(wasm_name)
+                .to_string_lossy()
+                .to_string();
+            let mut args: Vec<&str> = vec![&arg_output, &arg_opt_level, &target_wasm];
+
+            if self.reference_types {
+                args.push("--enable-reference-types");
+            }
+
+            args.extend(arg_opt_params.iter().map(|s| s.as_str()));
+
+            // Invoke wasm-opt.
+            tracing::debug!("calling wasm-opt for {wasm_name}");
+            common::run_command(wasm_opt_name, &wasm_opt, &args, &self.cfg.working_directory)
+                .await
+                .map_err(|err| check_target_not_found_err(err, wasm_opt_name))?;
+
+            // Copy the generated WASM file to the dist dir.
+            tracing::debug!(
+                "copying generated wasm-opt artifact from '{}' to '{target_wasm}'",
+                optimized_output.display()
+            );
+            fs::copy(&optimized_output, target_wasm)
+                .await
+                .context("error copying (optimized) wasm file to dist dir")?;
         }
-
-        args.extend(arg_opt_params.iter().map(|s| s.as_str()));
-
-        // Invoke wasm-opt.
-        tracing::debug!("calling wasm-opt");
-        common::run_command(wasm_opt_name, &wasm_opt, &args, &self.cfg.working_directory)
-            .await
-            .map_err(|err| check_target_not_found_err(err, wasm_opt_name))?;
-
-        // Copy the generated WASM file to the dist dir.
-        tracing::debug!("copying generated wasm-opt artifact from '{output}' to '{target_wasm}'");
-        fs::copy(output, target_wasm)
-            .await
-            .context("error copying (optimized) wasm file to dist dir")?;
 
         Ok(())
     }
@@ -982,6 +1173,143 @@ impl RustApp {
             )
             .await?;
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::rt::RtcBuild,
+        pipelines::{Attr, Attrs},
+    };
+    use std::{path::Path, sync::Arc};
+    use tempfile::tempdir;
+
+    async fn write_manifest(dir: &Path) -> Result<()> {
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).await?;
+        fs::write(
+            dir.join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"split-fixture\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+            ),
+        )
+        .await?;
+        fs::write(src_dir.join("main.rs"), "fn main() {}\n").await?;
+        Ok(())
+    }
+
+    fn attrs(entries: &[(&str, &str)]) -> Attrs {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    Attr {
+                        value: (*value).to_string(),
+                        need_escape: true,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn html_opt_in_enables_split() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let app = RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[("href", "Cargo.toml"), ("data-wasm-split", "")]),
+            0,
+        )
+        .await?;
+
+        assert!(app.split);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_split_enables_default_rust_app() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let mut cfg = RtcBuild::new_test(temp.path()).await?;
+        cfg.split = true;
+
+        let app = RustApp::new_default(Arc::new(cfg), Arc::new(temp.path().to_path_buf()), None)
+            .await?
+            .expect("default rust app should be created");
+
+        assert!(app.split);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_rejects_worker_assets() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let err = match RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[
+                ("href", "Cargo.toml"),
+                ("data-type", "worker"),
+                ("data-wasm-split", ""),
+            ]),
+            0,
+        )
+        .await
+        {
+            Ok(_) => panic!("worker assets must reject split mode"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("only supported for the main Rust application")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_requires_web_bindgen_target() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let err = match RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[
+                ("href", "Cargo.toml"),
+                ("data-wasm-split", ""),
+                ("data-bindgen-target", "no-modules"),
+            ]),
+            0,
+        )
+        .await
+        {
+            Ok(_) => panic!("split mode must reject non-web bindgen targets"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("requires data-bindgen-target=\"web\"")
+        );
         Ok(())
     }
 }

@@ -77,6 +77,10 @@ pub struct Build {
     #[serde(default = "default::filehash")]
     pub filehash: bool,
 
+    /// Enable split-WASM packaging for Rust main applications.
+    #[serde(default)]
+    pub split: bool,
+
     /// Whether to build an example.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +226,7 @@ impl Default for Build {
             features: vec![],
             example: None,
             filehash: default::filehash(),
+            split: false,
             pattern_script: None,
             inject_scripts: default::inject_scripts(),
             pattern_preload: None,
