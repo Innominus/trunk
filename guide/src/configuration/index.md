@@ -123,6 +123,7 @@ release = false             # Build in release mode.
 dist = "dist"               # The output dir for all final assets.
 public_url = "/"            # The public URL from which assets are to be served.
 filehash = true             # Whether to include hash values in the output file names.
+split = false               # Enable split-WASM packaging for the main Rust application.
 inject_scripts = true       # Whether to inject scripts (and module preloads) into the finalized output.
 offline = false             # Run without network access
 frozen = false              # Require Cargo.lock and cache are up to date

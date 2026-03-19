@@ -51,6 +51,8 @@ pub struct RtcBuild {
     /// If `true`, then files being processed should be hashed and the hash should be
     /// appended to the file's name.
     pub filehash: bool,
+    /// Enable split-WASM packaging for Rust main applications.
+    pub split: bool,
     /// The directory where final build artifacts are placed after a successful build.
     pub final_dist: PathBuf,
     /// The directory used to stage build artifacts during an active build.
@@ -198,6 +200,7 @@ impl RtcBuild {
             cargo_profile: build.cargo_profile,
             public_url,
             filehash: build.filehash,
+            split: build.split,
             staging_dist,
             final_dist,
             cargo_features,
@@ -244,6 +247,7 @@ impl RtcBuild {
             cargo_profile: None,
             public_url: Default::default(),
             filehash: true,
+            split: false,
             final_dist,
             staging_dist,
             cargo_features: Features::All,
