@@ -1245,3 +1245,202 @@ fn output_file_stem(path: impl AsRef<Path>) -> Result<String> {
         .to_string_lossy()
         .into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{rt::RtcBuild, types::Minify},
+        pipelines::{Attr, Attrs},
+    };
+    use std::{collections::HashSet, path::Path, sync::Arc};
+    use tempfile::tempdir;
+
+    async fn write_manifest(dir: &Path) -> Result<()> {
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).await?;
+        fs::write(
+            dir.join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"split-fixture\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+            ),
+        )
+        .await?;
+        fs::write(src_dir.join("main.rs"), "fn main() {}\n").await?;
+        Ok(())
+    }
+
+    fn attrs(entries: &[(&str, &str)]) -> Attrs {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    Attr {
+                        value: (*value).to_string(),
+                        need_escape: true,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    async fn test_app(dir: &Path, minify: Minify) -> Result<RustApp> {
+        let mut cfg = RtcBuild::new_test(dir).await?;
+        cfg.minify = minify;
+
+        RustApp::new_default(Arc::new(cfg), Arc::new(dir.to_path_buf()), None)
+            .await?
+            .context("default rust app should be created")
+    }
+
+    fn js_fixture() -> Vec<u8> {
+        b"export function demo () {  // comment\n  return 1 + 2;\n}\n".to_vec()
+    }
+
+    #[tokio::test]
+    async fn html_opt_in_enables_split() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let app = RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[("href", "Cargo.toml"), ("data-wasm-split", "")]),
+            0,
+        )
+        .await?;
+
+        assert!(app.split);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_rejects_worker_assets() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let err = RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[
+                ("href", "Cargo.toml"),
+                ("data-type", "worker"),
+                ("data-wasm-split", ""),
+            ]),
+            0,
+        )
+        .await
+        .err()
+        .expect("worker assets must reject split mode");
+
+        assert!(
+            err.to_string()
+                .contains("only supported for the main Rust application")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_requires_web_bindgen_target() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let cfg = Arc::new(RtcBuild::new_test(temp.path()).await?);
+
+        let err = RustApp::new(
+            cfg,
+            Arc::new(temp.path().to_path_buf()),
+            None,
+            attrs(&[
+                ("href", "Cargo.toml"),
+                ("data-wasm-split", ""),
+                ("data-bindgen-target", "no-modules"),
+            ]),
+            0,
+        )
+        .await
+        .err()
+        .expect("split mode must reject non-web bindgen targets");
+
+        assert!(
+            err.to_string()
+                .contains("requires data-bindgen-target=\"web\"")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_or_minify_js_bytes_minifies_generated_js() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let app = test_app(temp.path(), Minify::Always).await?;
+        let output = app.cfg.staging_dist.join("generated.js");
+
+        app.write_or_minify_js_bytes(js_fixture(), &output, JsModuleType::Module)
+            .await?;
+
+        let minified = fs::read_to_string(output).await?;
+        assert!(!minified.contains("comment"));
+        assert!(!minified.contains("\n  return"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn minify_snippet_outputs_only_minifies_js_assets() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let app = test_app(temp.path(), Minify::Always).await?;
+        let snippets_dir = app.cfg.staging_dist.join(SNIPPETS_DIR);
+        fs::create_dir_all(&snippets_dir).await?;
+
+        let js_path = snippets_dir.join("snippet.js");
+        let mjs_path = snippets_dir.join("snippet.mjs");
+        let txt_path = snippets_dir.join("snippet.txt");
+        let plain = "keep // comment\n";
+
+        fs::write(&js_path, js_fixture()).await?;
+        fs::write(&mjs_path, js_fixture()).await?;
+        fs::write(&txt_path, plain).await?;
+
+        let snippets = HashSet::from([js_path.clone(), mjs_path.clone(), txt_path.clone()]);
+        app.minify_snippet_outputs(&snippets).await?;
+
+        let js = fs::read_to_string(js_path).await?;
+        let mjs = fs::read_to_string(mjs_path).await?;
+        let txt = fs::read_to_string(txt_path).await?;
+
+        assert!(!js.contains("comment"));
+        assert!(!mjs.contains("comment"));
+        assert_eq!(txt, plain);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wasm_opt_reports_missing_staged_wasm_precisely() -> Result<()> {
+        let temp = tempdir()?;
+        write_manifest(temp.path()).await?;
+        let mut cfg = RtcBuild::new_test(temp.path()).await?;
+        cfg.release = true;
+        let mut app =
+            RustApp::new_default(Arc::new(cfg), Arc::new(temp.path().to_path_buf()), None)
+                .await?
+                .context("default rust app should be created")?;
+        app.wasm_opt = WasmOptLevel::Z;
+
+        let err = app
+            .wasm_opt_build(&["missing-chunk.wasm".to_string()])
+            .await
+            .expect_err("missing staged wasm should fail before invoking wasm-opt");
+
+        assert!(err.to_string().contains("expected staged wasm artifact"));
+        assert!(err.to_string().contains("missing-chunk.wasm"));
+        Ok(())
+    }
+}
