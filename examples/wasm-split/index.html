@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Trunk | wasm-split</title>
+    <base data-trunk-public-url/>
+</head>
+<body>
+    <main>
+        <nav>
+            <button id="nav-home" type="button">Home</button>
+            <button id="nav-details" type="button">Details</button>
+        </nav>
+
+        <h1 id="route-title">Booting</h1>
+        <p id="route-body">Preparing the application.</p>
+        <p id="count-value">Count: 1</p>
+        <p id="status">Starting up.</p>
+
+        <button id="local-add" type="button">Local +1</button>
+        <button id="lazy-add" type="button">Lazy +7</button>
+        <link data-trunk rel="rust" href="Cargo.toml" data-bin="wasm-split-example" data-wasm-split/>
+    </main>
+</body>
+</html>
